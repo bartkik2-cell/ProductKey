@@ -1,19 +1,9 @@
 # /api/activate.py
-# Production version with Supabase integration
+# Standalone version - all dependencies included
 
 from http.server import BaseHTTPRequestHandler
 import json
-import sys
 import os
-
-# Add parent directory to path to import from app
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-try:
-    from app.services.supabase import get_supabase_client
-except ImportError:
-    # Fallback for testing
-    get_supabase_client = None
 
 class handler(BaseHTTPRequestHandler):
     def _set_headers(self, status_code=200):
@@ -52,7 +42,6 @@ class handler(BaseHTTPRequestHandler):
                 }, 400)
             
             # Validate license key format (XXXX-XXXX-XXXX-XXXX = 19 chars with dashes)
-            # Remove dashes for validation
             key_no_dashes = key.replace('-', '')
             if len(key_no_dashes) != 16 or not key_no_dashes.isalnum():
                 print(f"[Activate] Invalid key format: {key}")
@@ -62,14 +51,27 @@ class handler(BaseHTTPRequestHandler):
             
             print(f"[Activate] Key: {key}, Device: {device_id}")
             
-            # Get Supabase client
-            if not get_supabase_client:
-                print("[Activate] ERROR: Supabase client not available")
+            # Get Supabase credentials from environment
+            SUPABASE_URL = os.environ.get("SUPABASE_URL")
+            SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+            
+            if not SUPABASE_URL or not SUPABASE_KEY:
+                print("[Activate] ERROR: Supabase credentials not set")
                 return self._send_json({
-                    'error': 'Database connection not available'
+                    'error': 'Database configuration error'
                 }, 500)
             
-            supabase = get_supabase_client()
+            # Import supabase here (lazy import)
+            try:
+                from supabase import create_client
+            except ImportError:
+                print("[Activate] ERROR: supabase package not installed")
+                return self._send_json({
+                    'error': 'Server configuration error'
+                }, 500)
+            
+            # Create Supabase client
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
             
             # 1. Look up license in database
             response = supabase.table('licenses').select('*').eq('license_key', key).execute()
@@ -82,16 +84,14 @@ class handler(BaseHTTPRequestHandler):
             
             license_record = response.data[0]
             
-            # 2. Check if license is active (not revoked/expired)
+            # 2. Get license details
             is_activated = license_record.get('is_activated', False)
             device_limit = license_record.get('device_limit', 1)
             activation_count = license_record.get('activation_count', 0)
             
-            # 3. Get current activated devices (stored as JSON array or comma-separated string)
+            # 3. Get current activated devices
             activated_devices = license_record.get('activated_devices', [])
-            if isinstance(activated_devices, str):
-                activated_devices = [d.strip() for d in activated_devices.split(',') if d.strip()]
-            elif activated_devices is None:
+            if activated_devices is None:
                 activated_devices = []
             
             print(f"[Activate] Current devices: {activated_devices}")
