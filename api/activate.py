@@ -1,130 +1,173 @@
 # /api/activate.py
-# SIMPLE TEST VERSION - Replace with database version for production
+# Production version with Supabase integration
 
 from http.server import BaseHTTPRequestHandler
 import json
+import sys
+import os
 
-# Valid keys
-VALID_KEYS = {
-    '21EZ5E9N8BXR1UEY': {
-        'active': True,
-        'maxDevices': 3
-    },
-}
+# Add parent directory to path to import from app
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# In-memory device storage (resets on deployment)
-# WARNING: This won't persist! Use a real database for production
-activated_devices = {}
+try:
+    from app.services.supabase import get_supabase_client
+except ImportError:
+    # Fallback for testing
+    get_supabase_client = None
 
 class handler(BaseHTTPRequestHandler):
+    def _set_headers(self, status_code=200):
+        """Set response headers with CORS"""
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+    
+    def _send_json(self, data, status_code=200):
+        """Send JSON response"""
+        self._set_headers(status_code)
+        self.wfile.write(json.dumps(data).encode())
+    
+    def do_OPTIONS(self):
+        """Handle CORS preflight"""
+        self._set_headers(200)
+    
     def do_POST(self):
         try:
             # Read request body
-            content_length = int(self.headers['Content-Length'])
+            content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
             
-            key = data.get('key')
-            device_id = data.get('device_id')
+            key = data.get('key', '').strip()
+            device_id = data.get('device_id', '').strip()
             
+            # Validate inputs
             if not key or not device_id:
-                self.send_response(400)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {'error': 'License key and device ID are required'}
-                self.wfile.write(json.dumps(response).encode())
-                return
+                print("[Activate] Missing key or device_id")
+                return self._send_json({
+                    'error': 'License key and device ID are required'
+                }, 400)
+            
+            # Validate license key format (XXXX-XXXX-XXXX-XXXX = 19 chars with dashes)
+            # Remove dashes for validation
+            key_no_dashes = key.replace('-', '')
+            if len(key_no_dashes) != 16 or not key_no_dashes.isalnum():
+                print(f"[Activate] Invalid key format: {key}")
+                return self._send_json({
+                    'error': 'Invalid license key format'
+                }, 400)
             
             print(f"[Activate] Key: {key}, Device: {device_id}")
             
-            # 1. Check if key exists
-            license_data = VALID_KEYS.get(key)
+            # Get Supabase client
+            if not get_supabase_client:
+                print("[Activate] ERROR: Supabase client not available")
+                return self._send_json({
+                    'error': 'Database connection not available'
+                }, 500)
             
-            if not license_data:
+            supabase = get_supabase_client()
+            
+            # 1. Look up license in database
+            response = supabase.table('licenses').select('*').eq('license_key', key).execute()
+            
+            if not response.data or len(response.data) == 0:
                 print(f"[Activate] Key not found: {key}")
-                self.send_response(404)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {'error': 'License key not found'}
-                self.wfile.write(json.dumps(response).encode())
-                return
+                return self._send_json({
+                    'error': 'License key not found'
+                }, 404)
             
-            # 2. Check if license is active
-            if not license_data.get('active'):
-                print(f"[Activate] Key inactive: {key}")
-                self.send_response(403)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {'error': 'License key is inactive'}
-                self.wfile.write(json.dumps(response).encode())
-                return
+            license_record = response.data[0]
             
-            # 3. Initialize devices list for this key if not exists
-            global activated_devices
-            if key not in activated_devices:
-                activated_devices[key] = []
+            # 2. Check if license is active (not revoked/expired)
+            is_activated = license_record.get('is_activated', False)
+            device_limit = license_record.get('device_limit', 1)
+            activation_count = license_record.get('activation_count', 0)
             
-            # 4. Check if device is already activated
-            if device_id in activated_devices[key]:
+            # 3. Get current activated devices (stored as JSON array or comma-separated string)
+            activated_devices = license_record.get('activated_devices', [])
+            if isinstance(activated_devices, str):
+                activated_devices = [d.strip() for d in activated_devices.split(',') if d.strip()]
+            elif activated_devices is None:
+                activated_devices = []
+            
+            print(f"[Activate] Current devices: {activated_devices}")
+            print(f"[Activate] Device limit: {device_limit}")
+            
+            # 4. Check if this device is already activated
+            if device_id in activated_devices:
                 print(f"[Activate] Device already activated: {device_id}")
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {
+                return self._send_json({
                     'success': True,
                     'message': 'Device already activated',
-                    'device_id': device_id
-                }
-                self.wfile.write(json.dumps(response).encode())
-                return
+                    'device_id': device_id,
+                    'devices_used': len(activated_devices),
+                    'devices_remaining': device_limit - len(activated_devices)
+                }, 200)
             
             # 5. Check device limit
-            max_devices = license_data.get('maxDevices', 3)
-            if len(activated_devices[key]) >= max_devices:
+            if len(activated_devices) >= device_limit:
                 print(f"[Activate] Max devices reached for key: {key}")
-                self.send_response(409)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {
+                return self._send_json({
                     'error': 'Maximum devices reached for this license',
-                    'current': len(activated_devices[key]),
-                    'max': max_devices
-                }
-                self.wfile.write(json.dumps(response).encode())
-                return
+                    'current': len(activated_devices),
+                    'max': device_limit
+                }, 409)
             
             # 6. Add device to license
-            activated_devices[key].append(device_id)
+            activated_devices.append(device_id)
+            
+            # Update database
+            from datetime import datetime
+            update_data = {
+                'activated_devices': activated_devices,
+                'is_activated': True,
+                'activation_count': activation_count + 1
+            }
+            
+            # Set activated_at timestamp only on first activation
+            if not is_activated:
+                update_data['activated_at'] = datetime.utcnow().isoformat()
+            
+            supabase.table('licenses').update(update_data).eq('license_key', key).execute()
             
             print(f"[Activate] Device activated successfully: {device_id}")
-            print(f"[Activate] Total devices for key {key}: {len(activated_devices[key])}")
+            print(f"[Activate] Total devices for key {key}: {len(activated_devices)}")
             
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            response = {
+            return self._send_json({
                 'success': True,
                 'message': 'License activated successfully',
                 'device_id': device_id,
-                'devices_used': len(activated_devices[key]),
-                'devices_remaining': max_devices - len(activated_devices[key])
-            }
-            self.wfile.write(json.dumps(response).encode())
+                'devices_used': len(activated_devices),
+                'devices_remaining': device_limit - len(activated_devices),
+                'license_info': {
+                    'customer_email': license_record.get('customer_email'),
+                    'product_name': license_record.get('product_name'),
+                    'expiry_date': license_record.get('expiry_date'),
+                    'created_at': license_record.get('created_at')
+                }
+            }, 200)
             
+        except json.JSONDecodeError as e:
+            print(f"[Activate] JSON decode error: {e}")
+            return self._send_json({
+                'error': 'Invalid JSON in request body'
+            }, 400)
+        
         except Exception as e:
             print(f"[Activate] Error: {e}")
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            response = {
+            import traceback
+            traceback.print_exc()
+            return self._send_json({
                 'error': 'Internal server error',
                 'detail': str(e)
-            }
-            self.wfile.write(json.dumps(response).encode())
+            }, 500)
     
     def do_GET(self):
-        self.send_response(405)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        response = {'error': 'Method not allowed'}
-        self.wfile.write(json.dumps(response).encode())
+        """GET method not allowed"""
+        return self._send_json({
+            'error': 'Method not allowed. Use POST to activate a license.'
+        }, 405)
